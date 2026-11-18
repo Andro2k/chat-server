@@ -1,37 +1,53 @@
 mod config;
 mod console;
 mod events;
+mod oauth;
 mod realtime;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use console::Console;
+use oauth::{OAuthClient, Source, TokenManager, TokenStore};
 use realtime::FeedItem;
 
-const USAGE: &str = "Uso: cargo run -- <nombre-del-canal> [--raw]\n\
-Ejemplo: cargo run -- xqc\n\n\
-  --raw   muestra también el JSON original de cada evento";
+const USAGE: &str = "\
+Uso: cargo run -- <nombre-del-canal> [--raw] [--login]
+     cargo run -- --login
+
+Ejemplo: cargo run -- xqc
+
+  --raw     muestra también el JSON original de cada evento
+  --login   inicia sesión con OAuth (credenciales en .env); sin canal, solo guarda la sesión";
 
 #[derive(Debug, PartialEq)]
 struct Cli {
-    channel: String,
+    channel: Option<String>,
     raw: bool,
+    login: bool,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut channel = None;
     let mut raw = false;
+    let mut login = false;
     for arg in args {
         match arg.as_str() {
             "--raw" => raw = true,
+            "--login" => login = true,
             flag if flag.starts_with("--") => return Err(format!("Opción desconocida: {flag}")),
             _ if channel.is_none() => channel = Some(arg),
             _ => return Err(format!("Argumento inesperado: {arg}")),
         }
     }
-    let channel = channel.ok_or_else(|| "Falta el nombre del canal".to_string())?;
-    Ok(Cli { channel, raw })
+    if channel.is_none() && !login {
+        return Err("Falta el nombre del canal".to_string());
+    }
+    Ok(Cli {
+        channel,
+        raw,
+        login,
+    })
 }
 
 #[tokio::main]
@@ -49,10 +65,17 @@ async fn main() -> Result<()> {
         .user_agent("chat-server/0.1 (Rust learning project)")
         .build()?;
 
-    console.status(&format!("Buscando el chat de Kick/{}...", cli.channel));
-    let channel = match config::channel_override(&cli.channel) {
+    if cli.login {
+        authenticate(&http, &console).await?;
+    }
+    let Some(slug) = cli.channel else {
+        return Ok(());
+    };
+
+    console.status(&format!("Buscando el chat de Kick/{slug}..."));
+    let channel = match config::channel_override(&slug) {
         Some(channel) => channel,
-        None => realtime::resolve_channel(&http, &cli.channel)
+        None => realtime::resolve_channel(&http, &slug)
             .await
             .context("No se pudo resolver el canal (si Kick devuelve 403, define KICK_CHANNEL_ID y KICK_CHATROOM_ID en .env)")?,
     };
@@ -75,6 +98,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn authenticate(http: &reqwest::Client, console: &Console) -> Result<TokenManager> {
+    let settings = config::Settings::from_env()?;
+    let store = TokenStore::new(settings.token_file.clone());
+    let oauth = OAuthClient::new(http.clone(), settings);
+    let (manager, source) = TokenManager::start(&oauth, &store, |url| {
+        console.status(&format!(
+            "Abre este enlace en tu navegador para autorizar:\n{url}"
+        ));
+    })
+    .await
+    .context("No se pudo iniciar sesión con OAuth")?;
+
+    let tokens = manager.snapshot().await;
+    let origin = match source {
+        Source::Restored => "restaurada",
+        Source::Refreshed => "renovada",
+        Source::NewLogin => "iniciada",
+    };
+    console.status(&format!(
+        "Sesión OAuth {origin} (scopes: {}; expira en {} min)",
+        tokens.scope,
+        tokens.seconds_left(oauth::unix_now()) / 60
+    ));
+    Ok(manager)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,32 +135,43 @@ mod tests {
             .into_iter()
     }
 
+    fn cli(channel: Option<&str>, raw: bool, login: bool) -> Cli {
+        Cli {
+            channel: channel.map(str::to_string),
+            raw,
+            login,
+        }
+    }
+
     #[test]
     fn parsea_canal_y_raw_en_cualquier_orden() {
-        let esperado = Cli {
-            channel: "xqc".into(),
-            raw: true,
-        };
         assert_eq!(
             parse_args(args(&["xqc", "--raw"])),
-            Ok(Cli {
-                channel: "xqc".into(),
-                raw: true
-            })
+            Ok(cli(Some("xqc"), true, false))
         );
-        assert_eq!(parse_args(args(&["--raw", "xqc"])), Ok(esperado));
+        assert_eq!(
+            parse_args(args(&["--raw", "xqc"])),
+            Ok(cli(Some("xqc"), true, false))
+        );
         assert_eq!(
             parse_args(args(&["xqc"])),
-            Ok(Cli {
-                channel: "xqc".into(),
-                raw: false
-            })
+            Ok(cli(Some("xqc"), false, false))
+        );
+    }
+
+    #[test]
+    fn login_puede_ir_solo_o_con_canal() {
+        assert_eq!(parse_args(args(&["--login"])), Ok(cli(None, false, true)));
+        assert_eq!(
+            parse_args(args(&["xqc", "--login"])),
+            Ok(cli(Some("xqc"), false, true))
         );
     }
 
     #[test]
     fn rechaza_entradas_invalidas() {
         assert!(parse_args(args(&[])).is_err());
+        assert!(parse_args(args(&["--raw"])).is_err());
         assert!(parse_args(args(&["a", "b"])).is_err());
         assert!(parse_args(args(&["a", "--nope"])).is_err());
     }
