@@ -1,167 +1,114 @@
-use anyhow::{Context, Result, anyhow};
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, protocol::Message},
-};
-use uuid::Uuid;
+mod console;
+mod events;
+mod realtime;
 
-const KICK_API: &str = "https://kick.com/api/v2/channels";
-const REALTIME_API: &str = "https://web.kick.com/api/v1/realtime";
+use anyhow::{Context, Result};
+use tokio::sync::mpsc;
+
+use console::Console;
+use realtime::FeedItem;
+
+const USAGE: &str = "Uso: cargo run -- <nombre-del-canal> [--raw]\n\
+Ejemplo: cargo run -- xqc\n\n\
+  --raw   muestra también el JSON original de cada evento";
+
+#[derive(Debug, PartialEq)]
+struct Cli {
+    channel: String,
+    raw: bool,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
+    let mut channel = None;
+    let mut raw = false;
+    for arg in args {
+        match arg.as_str() {
+            "--raw" => raw = true,
+            flag if flag.starts_with("--") => return Err(format!("Opción desconocida: {flag}")),
+            _ if channel.is_none() => channel = Some(arg),
+            _ => return Err(format!("Argumento inesperado: {arg}")),
+        }
+    }
+    let channel = channel.ok_or_else(|| "Falta el nombre del canal".to_string())?;
+    Ok(Cli { channel, raw })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Some(channel_slug) = std::env::args().nth(1) else {
-        eprintln!("Uso: cargo run -- <nombre-del-canal>");
-        eprintln!("Ejemplo: cargo run -- xqc");
-        std::process::exit(2);
+    let cli = match parse_args(std::env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(message) => {
+            eprintln!("{message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
     };
+    let console = Console::new(cli.raw);
 
     let http = reqwest::Client::builder()
         .user_agent("chat-server/0.1 (Rust learning project)")
         .build()?;
 
-    println!("Buscando el chat de Kick/{channel_slug}...");
-    let channel_url = format!("{KICK_API}/{channel_slug}");
-    let channel: Value = http
-        .get(channel_url)
-        .send()
-        .await?
-        .error_for_status()
-        .context("Kick no pudo encontrar ese canal")?
-        .json()
-        .await?;
-
-    let channel_id = channel["id"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("No encontré el id del canal en la respuesta de Kick"))?;
-    let chatroom_id = channel["chatroom"]["id"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("No encontré el id del chatroom en la respuesta de Kick"))?;
-
-    // Kick entrega una identidad temporal de invitado para conectarse al feed.
-    let client_id = Uuid::new_v4().to_string();
-    let token_response: Value = http
-        .post(format!("{REALTIME_API}/auth/connection"))
-        .json(&json!({ "client_id": client_id }))
-        .send()
-        .await?
-        .error_for_status()
-        .context("No se pudo pedir el token temporal de Kick")?
-        .json()
-        .await?;
-    let token = token_response["data"]["token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Kick no incluyó un token en su respuesta"))?;
-
-    // La URL del servidor realtime se negocia para cada conexión.
-    let connection_response: Value = http
-        .post(format!(
-            "{REALTIME_API}/channels/{channel_id}/chat/connection"
-        ))
-        .json(&json!({
-            "client": { "id": client_id, "type": "web" },
-            "capabilities": {
-                "accepted_providers": [
-                    { "provider": "centrifugo" },
-                    { "provider": "pusher" }
-                ]
-            }
-        }))
-        .send()
-        .await?
-        .error_for_status()
-        .context("No se pudo negociar la conexión realtime con Kick")?
-        .json()
-        .await?;
-    let websocket_url = connection_response["data"]["connections"]
-        .as_array()
-        .and_then(|connections| {
-            connections
-                .iter()
-                .find(|connection| connection["provider"] == "centrifugo")
-        })
-        .and_then(|connection| connection["credentials"]["url"].as_str())
-        .ok_or_else(|| anyhow!("Kick no ofreció una conexión Centrifugo"))?;
-
-    let mut request = websocket_url.into_client_request()?;
-    request.headers_mut().insert(
-        "Origin",
-        "https://kick.com".parse().expect("Origin fijo válido"),
-    );
-    let (mut socket, _) = connect_async(request)
+    console.status(&format!("Buscando el chat de Kick/{}...", cli.channel));
+    let channel = realtime::resolve_channel(&http, &cli.channel)
         .await
-        .context("No se pudo abrir el WebSocket de Kick")?;
+        .context("No se pudo resolver el canal")?;
 
-    // Centrifugo espera primero el token y luego una suscripción al chatroom.
-    socket
-        .send(Message::Text(
-            json!({ "id": 1, "connect": { "token": token, "name": "rust-chat" } })
-                .to_string()
-                .into(),
-        ))
-        .await?;
-    socket
-        .send(Message::Text(
-            json!({
-                "id": 2,
-                "subscribe": { "channel": format!("chatrooms.{chatroom_id}.v2") }
-            })
-            .to_string()
-            .into(),
-        ))
-        .await?;
+    let (tx, mut rx) = mpsc::channel(256);
+    tokio::spawn(realtime::run(http, channel, tx));
+    console.status("Escuchando (Ctrl+C para salir)");
 
-    println!("Conectado a Kick/{channel_slug}. Esperando mensajes... (Ctrl+C para salir)\n");
-
-    while let Some(frame) = socket.next().await {
-        match frame? {
-            Message::Text(text) => {
-                for line in text.lines() {
-                    let Ok(frame) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
-                    // Kick manda un objeto vacío como ping; responderlo mantiene viva la sesión.
-                    if frame.as_object().is_some_and(|object| object.is_empty()) {
-                        socket.send(Message::Text("{}".into())).await?;
-                        continue;
-                    }
-
-                    if let Some(publication) = frame.get("push").and_then(|push| push.get("pub")) {
-                        show_chat_message(publication);
-                    }
-                }
-            }
-            Message::Ping(bytes) => socket.send(Message::Pong(bytes)).await?,
-            Message::Close(_) => break,
-            _ => {}
+    loop {
+        tokio::select! {
+            item = rx.recv() => match item {
+                Some(FeedItem::Event { feed, published }) => console.event(&feed, &published),
+                Some(FeedItem::Status(text)) => console.status(&text),
+                None => break,
+            },
+            _ = tokio::signal::ctrl_c() => break,
         }
     }
-
-    println!("La conexión con Kick se cerró.");
+    console.status("Hasta luego.");
     Ok(())
 }
 
-fn show_chat_message(publication: &Value) {
-    let Some(event) = publication["data"]["event"].as_str() else {
-        return;
-    };
-    if event != "App\\Events\\ChatMessageEvent" {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> impl Iterator<Item = String> {
+        list.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
-    // El evento interno también puede venir como JSON serializado dentro del JSON exterior.
-    let event_data = match &publication["data"]["data"] {
-        Value::String(serialized) => serde_json::from_str::<Value>(serialized).ok(),
-        Value::Object(_) => Some(publication["data"]["data"].clone()),
-        _ => None,
-    };
-    let Some(message) = event_data else {
-        return;
-    };
-    let username = message["sender"]["username"].as_str().unwrap_or("alguien");
-    let content = message["content"].as_str().unwrap_or("");
-    println!("{username}: {content}");
+    #[test]
+    fn parsea_canal_y_raw_en_cualquier_orden() {
+        let esperado = Cli {
+            channel: "xqc".into(),
+            raw: true,
+        };
+        assert_eq!(
+            parse_args(args(&["xqc", "--raw"])),
+            Ok(Cli {
+                channel: "xqc".into(),
+                raw: true
+            })
+        );
+        assert_eq!(parse_args(args(&["--raw", "xqc"])), Ok(esperado));
+        assert_eq!(
+            parse_args(args(&["xqc"])),
+            Ok(Cli {
+                channel: "xqc".into(),
+                raw: false
+            })
+        );
+    }
+
+    #[test]
+    fn rechaza_entradas_invalidas() {
+        assert!(parse_args(args(&[])).is_err());
+        assert!(parse_args(args(&["a", "b"])).is_err());
+        assert!(parse_args(args(&["a", "--nope"])).is_err());
+    }
 }
