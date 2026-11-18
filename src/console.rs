@@ -15,6 +15,7 @@ const CYAN: &str = "\x1b[36m";
 
 const OTHER_PREVIEW_CHARS: usize = 160;
 
+#[derive(Clone, Copy)]
 pub struct Console {
     color: bool,
     raw: bool,

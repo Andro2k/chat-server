@@ -1,12 +1,15 @@
+mod api;
 mod config;
 mod console;
 mod events;
+mod input;
 mod oauth;
 mod realtime;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+use api::KickApi;
 use console::Console;
 use oauth::{OAuthClient, Source, TokenManager, TokenStore};
 use realtime::FeedItem;
@@ -65,9 +68,11 @@ async fn main() -> Result<()> {
         .user_agent("chat-server/0.1 (Rust learning project)")
         .build()?;
 
-    if cli.login {
-        authenticate(&http, &console).await?;
-    }
+    let tokens = if cli.login {
+        Some(authenticate(&http, &console).await?)
+    } else {
+        None
+    };
     let Some(slug) = cli.channel else {
         return Ok(());
     };
@@ -79,6 +84,10 @@ async fn main() -> Result<()> {
             .await
             .context("No se pudo resolver el canal (si Kick devuelve 403, define KICK_CHANNEL_ID y KICK_CHATROOM_ID en .env)")?,
     };
+
+    if let Some(tokens) = tokens {
+        start_chat_input(KickApi::new(http.clone(), tokens), &slug, console).await;
+    }
 
     let (tx, mut rx) = mpsc::channel(256);
     tokio::spawn(realtime::run(http, channel, tx));
@@ -102,7 +111,7 @@ async fn authenticate(http: &reqwest::Client, console: &Console) -> Result<Token
     let settings = config::Settings::from_env()?;
     let store = TokenStore::new(settings.token_file.clone());
     let oauth = OAuthClient::new(http.clone(), settings);
-    let (manager, source) = TokenManager::start(&oauth, &store, |url| {
+    let (manager, source) = TokenManager::start(oauth, store, |url| {
         console.status(&format!(
             "Abre este enlace en tu navegador para autorizar:\n{url}"
         ));
@@ -122,6 +131,31 @@ async fn authenticate(http: &reqwest::Client, console: &Console) -> Result<Token
         tokens.seconds_left(oauth::unix_now()) / 60
     ));
     Ok(manager)
+}
+
+/// Con sesión OAuth, lo que se escriba en la consola se envía al chat del canal.
+/// Si algo falla, se sigue escuchando en modo solo lectura.
+async fn start_chat_input(api: KickApi, slug: &str, console: Console) {
+    let setup = async { Ok::<_, anyhow::Error>((api.me().await?, api.channel(slug).await?)) }.await;
+    match setup {
+        Ok((me, channel)) => {
+            let state = if channel.is_live {
+                "en vivo"
+            } else {
+                "sin directo"
+            };
+            console.status(&format!(
+                "Autenticado como {} en Kick/{} ({state}). Escribe y pulsa Enter para enviar al chat.",
+                me.name, channel.slug
+            ));
+            tokio::spawn(input::forward_stdin(
+                api,
+                channel.broadcaster_user_id,
+                console,
+            ));
+        }
+        Err(error) => console.status(&format!("Envío de chat desactivado: {error:#}")),
+    }
 }
 
 #[cfg(test)]

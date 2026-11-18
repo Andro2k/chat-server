@@ -316,14 +316,16 @@ pub enum Source {
 }
 
 pub struct TokenManager {
+    oauth: OAuthClient,
+    store: TokenStore,
     tokens: Mutex<Tokens>,
 }
 
 impl TokenManager {
     /// Reutiliza los tokens guardados, los renueva o abre un login nuevo según haga falta.
     pub async fn start(
-        oauth: &OAuthClient,
-        store: &TokenStore,
+        oauth: OAuthClient,
+        store: TokenStore,
         on_url: impl FnOnce(&Url),
     ) -> Result<(Self, Source)> {
         let now = unix_now();
@@ -341,10 +343,36 @@ impl TokenManager {
         store.save(&tokens)?;
         Ok((
             Self {
+                oauth,
+                store,
                 tokens: Mutex::new(tokens),
             },
             source,
         ))
+    }
+
+    /// Token de acceso vigente; lo renueva (y lo guarda) si está por vencer.
+    pub async fn access_token(&self) -> Result<String> {
+        let mut tokens = self.tokens.lock().await;
+        if tokens.needs_refresh(unix_now()) {
+            let renewed = self.renew(&tokens).await?;
+            *tokens = renewed;
+        }
+        Ok(tokens.access_token.clone())
+    }
+
+    /// Renueva sin mirar la fecha: para cuando Kick responde 401 a un token que parecía válido.
+    pub async fn force_refresh(&self) -> Result<String> {
+        let mut tokens = self.tokens.lock().await;
+        let renewed = self.renew(&tokens).await?;
+        *tokens = renewed;
+        Ok(tokens.access_token.clone())
+    }
+
+    async fn renew(&self, current: &Tokens) -> Result<Tokens> {
+        let renewed = self.oauth.refresh(current).await?;
+        self.store.save(&renewed)?;
+        Ok(renewed)
     }
 
     pub async fn snapshot(&self) -> Tokens {
