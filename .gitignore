@@ -1,1 +1,3 @@
 /target
+.env
+.kick_tokens.json

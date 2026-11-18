@@ -1,3 +1,4 @@
+mod config;
 mod console;
 mod events;
 mod realtime;
@@ -49,9 +50,12 @@ async fn main() -> Result<()> {
         .build()?;
 
     console.status(&format!("Buscando el chat de Kick/{}...", cli.channel));
-    let channel = realtime::resolve_channel(&http, &cli.channel)
-        .await
-        .context("No se pudo resolver el canal")?;
+    let channel = match config::channel_override(&cli.channel) {
+        Some(channel) => channel,
+        None => realtime::resolve_channel(&http, &cli.channel)
+            .await
+            .context("No se pudo resolver el canal (si Kick devuelve 403, define KICK_CHANNEL_ID y KICK_CHATROOM_ID en .env)")?,
+    };
 
     let (tx, mut rx) = mpsc::channel(256);
     tokio::spawn(realtime::run(http, channel, tx));
